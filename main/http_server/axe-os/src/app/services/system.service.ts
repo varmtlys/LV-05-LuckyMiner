@@ -1,7 +1,6 @@
 import { HttpClient, HttpEvent } from '@angular/common/http';
 import { Injectable } from '@angular/core';
 import { delay, Observable, of } from 'rxjs';
-import { eASICModel } from 'src/models/enum/eASICModel';
 import { ISystemInfo } from 'src/models/ISystemInfo';
 
 import { environment } from '../../environments/environment';
@@ -34,13 +33,22 @@ export class SystemService {
           ssid: "default",
           wifiPass: "password",
           wifiStatus: "Connected!",
+          versionMask: "1fffe000",
+          stratumQueue: 0,
+          asicQueue: 0,
+          asicResults: 0,
+          lastPoolError: "",
+          sharesSubmitted: 1,
           sharesAccepted: 1,
           sharesRejected: 0,
           uptimeSeconds: 38,
-          ASICModel: eASICModel.BM1366,
+          ASICModel: "BM1397",
           stratumURL: "public-pool.io",
           stratumPort: 21496,
           stratumUser: "bc1q99n3pu025yyu0jlywpmwzalyhm36tg5u37w20d.Lucky-U1",
+          stratumPassword: "x",
+          resetReason: "power on",
+          haltReason: "",
           frequency: 485,
           version: "2.0",
           flipscreen: 1,

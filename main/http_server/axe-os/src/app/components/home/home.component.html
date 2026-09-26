@@ -7,11 +7,11 @@
     <div class="container">
         <div>
             <div class="card">
-                <h2>Overview</h2>
+                <h2>Overview pupupu</h2>
                 <table *ngIf="info$ | async as info; else loading">
                     <tr>
                         <td>Model:</td>
-                        <td>{{info.ASICModel == 'BM1397' ? 'LV05' : 'LV06'}}</td>
+                        <td>LV05</td>
                     </tr>
                     <tr>
                         <td>Uptime:</td>
@@ -28,6 +28,14 @@
                     <tr>
                         <td>Version:</td>
                         <td>{{info.version}}</td>
+                    </tr>
+                    <tr>
+                        <td>Last Restart:</td>
+                        <td>{{info.resetReason}}</td>
+                    </tr>
+                    <tr *ngIf="info.haltReason">
+                        <td>Mining Stopped:</td>
+                        <td>{{info.haltReason}}</td>
                     </tr>
                 </table>
             </div>

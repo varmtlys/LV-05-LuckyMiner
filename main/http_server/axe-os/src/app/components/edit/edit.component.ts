@@ -5,7 +5,6 @@ import { ToastrService } from 'ngx-toastr';
 import { startWith } from 'rxjs';
 import { LoadingService } from 'src/app/services/loading.service';
 import { SystemService } from 'src/app/services/system.service';
-import { eASICModel } from 'src/models/enum/eASICModel';
 
 @Component({
   selector: 'app-edit',
@@ -21,8 +20,6 @@ export class EditComponent implements OnInit {
 
 
   public devToolsOpen: boolean = false;
-  public eASICModel = eASICModel;
-  public ASICModel!: eASICModel;
 
   @Input() uri = '';
 
@@ -42,7 +39,6 @@ export class EditComponent implements OnInit {
     this.systemService.getInfo(this.uri)
       .pipe(this.loadingService.lockUIUntilComplete())
       .subscribe(info => {
-        this.ASICModel = info.ASICModel;
         this.form = this.fb.group({
           flipscreen: [info.flipscreen == 1],
           invertscreen: [info.invertscreen == 1],
@@ -58,6 +54,7 @@ export class EditComponent implements OnInit {
             Validators.max(65353)
           ]],
           stratumUser: [info.stratumUser, [Validators.required]],
+          stratumPassword: [info.stratumPassword],
           ssid: [info.ssid, [Validators.required]],
           wifiPass: [info.wifiPass, [Validators.required]],
           coreVoltage: [info.coreVoltage, [Validators.required]],

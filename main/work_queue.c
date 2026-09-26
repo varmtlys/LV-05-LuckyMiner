@@ -69,10 +69,7 @@ void ASIC_jobs_queue_clear(work_queue *queue)
 
     while (queue->count > 0)
     {
-        bm_job *next_work = queue->buffer[queue->head];
-        free(next_work->jobid);
-        free(next_work->extranonce2);
-        free(next_work);
+        free(queue->buffer[queue->head]);
         queue->head = (queue->head + 1) % QUEUE_SIZE;
         queue->count--;
     }

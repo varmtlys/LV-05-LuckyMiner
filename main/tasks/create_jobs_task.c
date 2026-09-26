@@ -1,9 +1,9 @@
 #include "work_queue.h"
 #include "global_state.h"
 #include "esp_log.h"
+#include "esp_random.h"
 #include "esp_system.h"
 #include "mining.h"
-#include <limits.h>
 #include "string.h"
 
 #include <sys/time.h>
@@ -20,8 +20,17 @@ void create_jobs_task(void *pvParameters)
         mining_notify *mining_notification = (mining_notify *)queue_dequeue(&GLOBAL_STATE->stratum_queue);
         ESP_LOGI(TAG, "New Work Dequeued %s", mining_notification->job_id);
 
-        uint32_t extranonce_2 = 0;
-        while (GLOBAL_STATE->stratum_queue.count < 1 && extranonce_2 < UINT_MAX && GLOBAL_STATE->abandon_work == 0)
+        // extranonce2 is only extranonce_2_len bytes wide. Counting past that wraps in the
+        // generator and silently repeats work the pool has already seen, so bound the count by
+        // the field, and start at a random offset - counting from 0 after every notify means the
+        // chip keeps re-hashing the same first few extranonce2 values.
+        int e2_len = GLOBAL_STATE->extranonce_2_len;
+        uint64_t e2_space = (e2_len >= 4) ? 0x100000000ULL : (1ULL << (8 * e2_len));
+        uint32_t extranonce_2 = esp_random() % e2_space;
+
+        for (uint64_t sent = 0;
+             sent < e2_space && GLOBAL_STATE->stratum_queue.count < 1 && GLOBAL_STATE->abandon_work == 0;
+             sent++, extranonce_2 = (extranonce_2 + 1) % e2_space)
         {
             char *extranonce_2_str = extranonce_2_generate(extranonce_2, GLOBAL_STATE->extranonce_2_len);
 
@@ -32,8 +41,7 @@ void create_jobs_task(void *pvParameters)
 
             bm_job *queued_next_job = malloc(sizeof(bm_job));
             memcpy(queued_next_job, &next_job, sizeof(bm_job));
-            queued_next_job->extranonce2 = strdup(extranonce_2_str);
-            queued_next_job->jobid = strdup(mining_notification->job_id);
+            bm_job_set_ids(queued_next_job, mining_notification->job_id, extranonce_2_str);
             queued_next_job->version_mask = GLOBAL_STATE->version_mask;
 
             queue_enqueue(&GLOBAL_STATE->ASIC_jobs_queue, queued_next_job);
@@ -41,7 +49,6 @@ void create_jobs_task(void *pvParameters)
             free(coinbase_tx);
             free(merkle_root);
             free(extranonce_2_str);
-            extranonce_2++;
         }
 
         if (GLOBAL_STATE->abandon_work == 1)

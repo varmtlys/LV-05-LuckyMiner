@@ -2,7 +2,6 @@
 #define GLOBAL_STATE_H_
 
 #include "asic_task.h"
-#include "bm1366.h"
 #include "bm1397.h"
 #include "common.h"
 #include "power_management_task.h"
@@ -13,19 +12,14 @@
 
 #define STRATUM_USER CONFIG_STRATUM_USER
 
-typedef struct
-{
-    void (*init_fn)(u_int64_t);
-    task_result * (*receive_result_fn)(void * GLOBAL_STATE);
-    int (*set_max_baud_fn)(void);
-    void (*set_difficulty_mask_fn)(int);
-    void (*send_work_fn)(void * GLOBAL_STATE, bm_job * next_bm_job);
-} AsicFunctions;
+// extranonce1 as hex. Pools use 8-16 bytes, so 64 chars leaves plenty of headroom.
+#define EXTRANONCE_STR_SIZE 64
+
+// The only ASIC this board carries.
+#define ASIC_MODEL "BM1397"
 
 typedef struct
 {
-    char * asic_model;
-    AsicFunctions ASIC_functions;
     double asic_job_frequency_ms;
 
     work_queue stratum_queue;
@@ -36,14 +30,19 @@ typedef struct
     AsicTaskModule ASIC_TASK_MODULE;
     PowerManagementModule POWER_MANAGEMENT_MODULE;
 
-    char * extranonce_str;
+    // A fixed buffer, not a heap pointer: create_jobs_task reads this continuously from another
+    // task, and mining.set_extranonce can replace it mid-run. Freeing it would dangle under that
+    // reader; overwriting in place cannot.
+    char extranonce_str[EXTRANONCE_STR_SIZE];
     int extranonce_2_len;
     int abandon_work;
 
     uint8_t * valid_jobs;
     pthread_mutex_t valid_jobs_lock;
 
-    uint32_t stratum_difficulty;
+    // what the chip is currently programmed to report at, and the power of two it rounded to
+    double stratum_difficulty;
+    double asic_ticket_diff;
     uint32_t version_mask;
 
     int sock;

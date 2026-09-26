@@ -8,7 +8,6 @@
 #include "adc.h"
 #include "connect.h"
 #include "global_state.h"
-#include "led_controller.h"
 #include "nvs_config.h"
 #include "oled.h"
 
@@ -41,6 +40,9 @@ static void _init_system(GlobalState * global_state, SystemModule * module)
     module->historical_hashrate_init = 0;
     module->current_hashrate = 0;
     module->screen_page = 0;
+    module->asic_results = 0;
+    module->last_pool_error[0] = 0;
+    module->shares_submitted = 0;
     module->shares_accepted = 0;
     module->shares_rejected = 0;
     module->best_nonce_diff = nvs_config_get_u64(NVS_CONFIG_BEST_DIFF, 0);
@@ -48,6 +50,7 @@ static void _init_system(GlobalState * global_state, SystemModule * module)
     module->lastClockSync = 0;
     module->FOUND_BLOCK = false;
     module->startup_done = false;
+    module->halt_reason = NULL;
 
     // set the best diff string
     _suffix_string(module->best_nonce_diff, module->best_diff_string, DIFF_STRING_SIZE, 0);
@@ -57,11 +60,6 @@ static void _init_system(GlobalState * global_state, SystemModule * module)
 
     // set the wifi_status to blank
     memset(module->wifi_status, 0, 20);
-
-    // test the LEDs
-    //  ESP_LOGI(TAG, "Init LEDs!");
-    //  ledc_init();
-    //  led_set();
 
     // Playing with BI level
     gpio_set_direction(GPIO_NUM_10, GPIO_MODE_OUTPUT);
@@ -93,6 +91,19 @@ static void _init_system(GlobalState * global_state, SystemModule * module)
     netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
 }
 
+// Shown on every screen so a reflash is visible on the device itself. Text comes from
+// PROJECT_VER in the top CMakeLists; the precision keeps it inside oled_buf.
+static void _draw_version(SystemModule * module, int line)
+{
+    memset(module->oled_buf, 0, 20);
+    if (module->halt_reason != NULL) {
+        snprintf(module->oled_buf, 20, "STOP: %.13s", module->halt_reason);
+    } else {
+        snprintf(module->oled_buf, 20, "FW: %.15s", esp_app_get_description()->version);
+    }
+    OLED_writeString(1, line, module->oled_buf);
+}
+
 static void _update_hashrate(GlobalState * GLOBAL_STATE)
 {
     SystemModule * module = &GLOBAL_STATE->SYSTEM_MODULE;
@@ -108,17 +119,6 @@ static void _update_hashrate(GlobalState * GLOBAL_STATE)
     snprintf(module->oled_buf, 20, "Gh%s: %.1f W/Th: %.1f", module->historical_hashrate_init < HISTORY_LENGTH ? "*" : "",
              module->current_hashrate, efficiency);
     OLED_writeString(1, 0, module->oled_buf);
-}
-
-static void _update_shares(SystemModule * module)
-{
-    if (module->screen_page != 0) {
-        return;
-    }
-    OLED_clearLine(1);
-    memset(module->oled_buf, 0, 20);
-    snprintf(module->oled_buf, 20, "A/R: %u/%u", module->shares_accepted, module->shares_rejected);
-    OLED_writeString(1, 1, module->oled_buf);
 }
 
 static void _update_best_diff(SystemModule * module)
@@ -138,6 +138,47 @@ static void _update_best_diff(SystemModule * module)
     memset(module->oled_buf, 0, 20);
     snprintf(module->oled_buf, 20, "IP: %s", ip_address_str);
     OLED_writeString(1, 2, module->oled_buf);
+}
+
+// 8x8 sprites in the panel's own format: one byte per pixel column, LSB at the top.
+// The pick swings through frames 0-1-2-1 while the chip is producing results; when it is not,
+// a crossed out circle sits in the same corner instead.
+static const uint8_t PICK_FRAMES[3][8] = {
+    {0xa0, 0x90, 0x8c, 0x86, 0x83, 0x81, 0x81, 0x80}, // raised
+    {0xc0, 0xa0, 0xa0, 0x90, 0x88, 0x8c, 0x84, 0x84}, // mid swing
+    {0xc0, 0xc4, 0xa0, 0xa0, 0x90, 0x90, 0x88, 0x88}, // struck, with a spark
+};
+static const uint8_t PICK_ORDER[4] = {0, 1, 2, 1};
+static const uint8_t STOPPED_ICON[8] = {0x18, 0x24, 0x62, 0x52, 0x4a, 0x46, 0x24, 0x18};
+
+// Last 8 columns of the bottom line. Text lines are 19 characters at 6 px, so nothing else
+// reaches this far right on any screen page.
+#define STATUS_ICON_X 120
+#define STATUS_ICON_PAGE 3
+#define STATUS_TICK_MS 250
+
+static bool _is_mining(GlobalState * GLOBAL_STATE)
+{
+    // Losing WiFi stops the shares but not the hashrate reading, so it has to be checked too
+    return GLOBAL_STATE->SYSTEM_MODULE.halt_reason == NULL && GLOBAL_STATE->SYSTEM_MODULE.current_hashrate > 0 &&
+           strcmp(GLOBAL_STATE->SYSTEM_MODULE.wifi_status, "Connected!") == 0;
+}
+
+// Hold a screen for the given time, animating the status icon while it waits.
+static void _screen_delay(GlobalState * GLOBAL_STATE, int ms)
+{
+    static int frame = 0;
+
+    for (int waited = 0; waited < ms; waited += STATUS_TICK_MS) {
+        if (OLED_status()) {
+            if (_is_mining(GLOBAL_STATE)) {
+                OLED_writeBitmap(STATUS_ICON_X, STATUS_ICON_PAGE, PICK_FRAMES[PICK_ORDER[frame++ & 3]], 8);
+            } else {
+                OLED_writeBitmap(STATUS_ICON_X, STATUS_ICON_PAGE, STOPPED_ICON, 8);
+            }
+        }
+        vTaskDelay(STATUS_TICK_MS / portTICK_PERIOD_MS);
+    }
 }
 
 static void _clear_display(void)
@@ -167,9 +208,7 @@ static void _update_system_info(GlobalState * GLOBAL_STATE)
         snprintf(module->oled_buf, 20, "Pwr: %.3f W", power_management->power);
         OLED_writeString(1, 2, module->oled_buf);
 
-        // memset(module->oled_buf, 0, 20);
-        // snprintf(module->oled_buf, 20, " %i mV: %i mA", (int) power_management->voltage, (int) power_management->current);
-        // OLED_writeString(1, 3, module->oled_buf);
+        _draw_version(module, 3);
     }
 }
 
@@ -189,7 +228,7 @@ static void _update_esp32_info(SystemModule * module)
         snprintf(module->oled_buf, 20, "vCore: %u mV", vcore);
         OLED_writeString(1, 1, module->oled_buf);
 
-        OLED_writeString(1, 2, esp_app_get_description()->version);
+        _draw_version(module, 2);
     }
 }
 
@@ -205,6 +244,9 @@ static void _init_connection(SystemModule * module)
 static void _update_connection(SystemModule * module)
 {
     if (OLED_status()) {
+        OLED_clearLine(0);
+        _draw_version(module, 0);
+
         OLED_clearLine(2);
         memset(module->oled_buf, 0, 20);
         snprintf(module->oled_buf, 20, "%s", module->ssid);
@@ -231,12 +273,13 @@ static void _update_system_performance(GlobalState * GLOBAL_STATE)
     if (OLED_status()) {
 
         _update_hashrate(GLOBAL_STATE);
-        //_update_shares(module);
         _update_best_diff(module);
 
         memset(module->oled_buf, 0, 20);
         snprintf(module->oled_buf, 20, "UT: %dd %ih %im", uptime_in_days, uptime_in_hours, uptime_in_minutes);
         OLED_writeString(1, 1, module->oled_buf);
+
+        _draw_version(module, 3);
     }
 }
 
@@ -358,11 +401,6 @@ void SYSTEM_task(void * pvParameters)
     wifi_mode_t wifi_mode;
     esp_err_t result;
 
-    while (GLOBAL_STATE->ASIC_functions.init_fn == NULL) {
-        show_ap_information("ASIC MODEL INVALID");
-        vTaskDelay(5000 / portTICK_PERIOD_MS);
-    }
-
     // show the connection screen
     while (!module->startup_done) {
         result = esp_wifi_get_mode(&wifi_mode);
@@ -380,29 +418,27 @@ void SYSTEM_task(void * pvParameters)
         _clear_display();
         module->screen_page = 0;
         _update_system_performance(GLOBAL_STATE);
-        vTaskDelay(40000 / portTICK_PERIOD_MS);
+        _screen_delay(GLOBAL_STATE, 40000);
 
         _clear_display();
         module->screen_page = 1;
         _update_system_info(GLOBAL_STATE);
-        vTaskDelay(10000 / portTICK_PERIOD_MS);
+        _screen_delay(GLOBAL_STATE, 10000);
 
         _clear_display();
         module->screen_page = 2;
         _update_esp32_info(module);
-        vTaskDelay(10000 / portTICK_PERIOD_MS);
+        _screen_delay(GLOBAL_STATE, 10000);
     }
 }
 
 void SYSTEM_notify_accepted_share(SystemModule * module)
 {
     module->shares_accepted++;
-    //_update_shares(module);
 }
 void SYSTEM_notify_rejected_share(SystemModule * module)
 {
     module->shares_rejected++;
-    //_update_shares(module);
 }
 
 void SYSTEM_notify_mining_started(SystemModule * module)
@@ -459,7 +495,10 @@ void SYSTEM_notify_found_nonce(SystemModule * module, double pool_diff, double f
         module->current_hashrate = ((module->current_hashrate * 9) + rolling_rate) / 10;
     }
 
-    _update_hashrate(module);
+    // _update_hashrate() used to be called here with a SystemModule* where it expects a
+    // GlobalState*, so it read screen_page and POWER_MANAGEMENT_MODULE past the end of the
+    // struct on every share found. _update_system_performance() redraws that same line with
+    // the right pointer, so dropping the call loses nothing but the immediate refresh.
 
     // logArrayContents(historical_hashrate, HISTORY_LENGTH);
     // logArrayContents(historical_hashrate_time_stamps, HISTORY_LENGTH);

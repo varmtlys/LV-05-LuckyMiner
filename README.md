@@ -1,99 +1,106 @@
-LV05-Miner
+# LV-05 LuckyMiner
 
-fork from https://github.com/bitaxeorg/ESP-Miner v2.0.4
+Firmware for the **LV-05 LuckyMiner**, a single-ASIC Bitcoin miner built around the
+**Bitmain BM1397** on an ESP32-S3. It is a hardened, single-board rebuild of the
+open-source [ESP-Miner](https://github.com/bitaxeorg/ESP-Miner) / BitAxe firmware:
+everything specific to other ASICs and boards has been stripped out, and the mining
+hot path, network resilience and on-device display have been reworked so the board
+keeps hashing and stays reachable without a USB cable.
 
-# ESP-Miner
+| | |
+| --- | --- |
+| **ASIC** | Bitmain BM1397 (672 cores) |
+| **MCU** | ESP32-S3 |
+| **Display** | 128×32 SSD1306 OLED |
+| **Toolchain** | ESP-IDF v5.1 |
+| **Pool protocol** | Stratum V1 with BIP310 version rolling |
 
-| Supported Targets | ESP32-S3 (BitAxe v2+) |
-| ----------------- | --------------------- |
+---
 
+## What's fixed in this build
 
-## Requires ESP-IDF v5.1
+This firmware started as a generic multi-ASIC codebase. The changes below make it
+correct and reliable for the LV-05's single BM1397.
 
-You can chose between 2 methods of installations:
+### Mining works and can be measured
+- **Measurable hashrate.** The ASIC ticket difficulty is capped at 256, so the chip
+  reports a result roughly every few seconds instead of a few times per hour. The
+  estimator now weighs every result by the chip's actual threshold, so the hashrate
+  reading settles within a minute instead of a day. (The number may look *lower* than
+  before — it is now honest rather than noise from three samples.)
+- **Cadence follows the real clock.** Job timing is derived from the frequency the
+  power-management task actually settled on, not the NVS target, so the chip finishes
+  its nonce space before each job is replaced — even while it ramps up or throttles.
+- **Correct shares.** Every reported nonce is verified and, when it beats the pool
+  difficulty, submitted with the right rolled version and extranonce2.
 
-### Manual Installation
+### Network no longer "falls off" at random
+- **Infinite WiFi reconnect.** The old handler stopped calling `esp_wifi_connect()`
+  after 5 failed retries and never came back — a router reboot or a few seconds of
+  interference took the miner off the network until it was power-cycled. It now retries
+  forever (fast at first, then every 5 s) and logs the disconnect reason code.
+- **Pool watchdog.** A 300 s receive timeout plus TCP keepalive means a half-open pool
+  connection reconnects instead of parking the mining task in `recv()` forever.
 
-Follow the official [instructions](https://docs.espressif.com/projects/esp-idf/en/release-v5.1/esp32s3/get-started/index.html#manual-installation).
+### Safer hot path
+- **No more use-after-free.** Only 32 job slots exist and they recycle about every
+  0.6 s. The result reader now copies the job under the lock before verifying and
+  submitting it, closing a race that could crash the miner under load.
+- **Less heap churn.** Job identifiers are inlined into the job struct, removing two
+  `malloc`/`free` pairs per job on a ~50 jobs/s path.
 
-### ESP-IDF Visual Studio Code Extension
+### On-device display
+- The OLED shows an **animated pickaxe** while the board is actually mining (chip
+  producing results *and* WiFi connected), and a **crossed-out icon** when it is not —
+  visible at a glance without opening the web UI. Built with `-O2` optimisation.
 
-Install the "Espressif IDF" extension, it will automate the IDF installation for you.
+### Fault handling
+- A genuine fault **halts and stays reachable** (the web UI and OLED keep working)
+  instead of rebooting — important because the LV-05 has no exposed USB/serial.
 
-## Hardware Required
+---
 
-This firmware is designed to run on a BitAxe v2+
+## Build
 
-## Configure the project
+Requires **ESP-IDF v5.1**. Follow the official
+[install guide](https://docs.espressif.com/projects/esp-idf/en/release-v5.1/esp32s3/get-started/index.html)
+or the "Espressif IDF" VS Code extension.
 
-Set the target
-
-```
+```bash
 idf.py set-target esp32s3
+idf.py menuconfig   # set Stratum + WiFi under the project options
+idf.py build
 ```
 
-Use menuconfig to set the stratum server address/port and WiFi SSID/Password
+The web UI is bundled into `www.bin` at build time. To rebuild it:
 
-```
-idf.py menuconfig
-```
-
-Set following parameters under Stratum Configuration Options, these will define the stratum server you connect to:
-
-* Set `Stratum Address` to the stratum pool domain name. example "public-pool.io"
-
-* Set `Stratum Port` to the stratum pool port. example "21496"
-
-* Set `Stratum username` to the stratum pool username. example "<my_BTC_address>.bitaxe"
-
-* Set `Stratum password` to the stratum pool password. example "x"
-
-Set following parameters under Example Connection Configuration Options:
-
-* Set `WiFi SSID` to your target wifi network SSID.
-
-* Set `Wifi Password` to the password for your target SSID.
-
-For more information about the example_connect() method used here, check out <https://github.com/espressif/esp-idf/blob/master/examples/protocols/README.md>.
-
-## Build website
-
-To build the website for viewing and OTA updates open the Angular project found in
-```
-ESP-Miner\main\http_server\axe-os
-```
-
-Then install dependencies and build.
-
-```
-npm i
+```bash
+cd main/http_server/axe-os
+npm install
 npm run build
 ```
 
+## Flash
 
- When the esp-idf project is built it will bundle the website in www.bin
-
-
-## Build and Flash
-
-Build the project and flash it to the board, then run monitor tool to view serial output:
-
-```
+```bash
 idf.py -p PORT flash monitor
 ```
 
-(To exit the serial monitor, type ``Ctrl-]``.)
+Once running, the firmware can be updated over the air from its web interface
+(`esp-miner.bin` for the app, `www.bin` for the UI) — no cable needed.
 
-See the Getting Started Guide for full steps to configure and use ESP-IDF to build projects.
+## Host self-check
 
-## Run Unit tests
+The arithmetic in the mining hot path (extranonce2 walk, ticket difficulty, hashrate
+weighting) has a hardware-free test that runs on any host:
 
-The unit tests for the project use the unity test framework and currently require actual esp32 hardware to run.
-
-They are located at <https://github.com/johnny9/esp-miner/tree/master/components/stratum/test>
-
+```bash
+gcc -O2 -o check_hot_path test/host/check_hot_path.c && ./check_hot_path
 ```
-cd ./test/
-idf.py set-target esp32s3
-idf.py -p PORT flash monitor
-```
+
+---
+
+## Credits & licence
+
+Derived from [ESP-Miner](https://github.com/bitaxeorg/ESP-Miner) (BitAxe) v2.0.4.
+Licensed under **GPL-3.0** — see [LICENSE](LICENSE).

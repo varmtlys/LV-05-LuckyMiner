@@ -1,15 +1,20 @@
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "global_state.h"
 #include "work_queue.h"
 #include "serial.h"
 #include "bm1397.h"
 #include <string.h>
 #include "esp_log.h"
-
-#include "driver/i2c.h"
+#include "nvs_config.h"
 
 static const char *TAG = "ASIC_task";
 
-// static bm_job ** active_jobs; is required to keep track of the active jobs since the
+// Cap on the chip's reporting threshold. A pool difficulty of 16384 makes the chip report once
+// every few minutes, which is far too rare to measure a hashrate from; capping the ticket mask
+// costs a fraction of a result per second and gives a usable estimate within a minute. Results
+// below the pool difficulty are simply never submitted.
+#define ASIC_TICKET_DIFF_CAP 256
 
 void ASIC_task(void *pvParameters)
 {
@@ -25,7 +30,7 @@ void ASIC_task(void *pvParameters)
         GLOBAL_STATE->valid_jobs[i] = 0;
     }
 
-    int baud = (*GLOBAL_STATE->ASIC_functions.set_max_baud_fn)();
+    int baud = BM1397_set_max_baud();
     vTaskDelay(10 / portTICK_PERIOD_MS);
     SERIAL_set_baud(baud);
 
@@ -34,19 +39,42 @@ void ASIC_task(void *pvParameters)
     while (1)
     {
 
-        bm_job *next_bm_job = (bm_job *)queue_dequeue(&GLOBAL_STATE->ASIC_jobs_queue);
-
-        if (next_bm_job->pool_diff != GLOBAL_STATE->stratum_difficulty)
-        {
-            // ESP_LOGI(TAG, "New difficulty %d", next_bm_job->pool_diff);
-            (*GLOBAL_STATE->ASIC_functions.set_difficulty_mask_fn)(next_bm_job->pool_diff);
-            GLOBAL_STATE->stratum_difficulty = next_bm_job->pool_diff;
+        // a fault stopped mining; idle here so the rest of the system stays responsive
+        if (GLOBAL_STATE->SYSTEM_MODULE.halt_reason != NULL) {
+            vTaskDelay(1000 / portTICK_PERIOD_MS);
+            continue;
         }
 
-        (*GLOBAL_STATE->ASIC_functions.send_work_fn)(GLOBAL_STATE, next_bm_job); // send the job to the ASIC
+        bm_job *next_bm_job = (bm_job *)queue_dequeue(&GLOBAL_STATE->ASIC_jobs_queue);
+
+        // the ASIC ticket mask is a power of two, so a pool difficulty below 1 must not reach it as 0
+        double ticket = next_bm_job->pool_diff < 1 ? 1 : next_bm_job->pool_diff;
+        if (ticket > ASIC_TICKET_DIFF_CAP)
+        {
+            ticket = ASIC_TICKET_DIFF_CAP;
+        }
+
+        if (ticket != GLOBAL_STATE->stratum_difficulty)
+        {
+            BM1397_set_job_difficulty_mask((int) ticket);
+            GLOBAL_STATE->stratum_difficulty = ticket;
+            // what the chip actually ended up with, and the weight of every result it reports
+            GLOBAL_STATE->asic_ticket_diff = _largest_power_of_two((int) ticket);
+        }
+
+        BM1397_send_work(GLOBAL_STATE, next_bm_job);
+
+        // Follow the frequency the power management task actually settled on, not the one asked
+        // for in NVS. While the chip ramps up or throttles down, a cadence fixed at the target
+        // replaces each job before the chip has finished its nonce space.
+        double frequency = GLOBAL_STATE->POWER_MANAGEMENT_MODULE.frequency_value;
+        if (frequency < 1)
+        {
+            frequency = 1;
+        }
+        GLOBAL_STATE->asic_job_frequency_ms = ((double) NONCE_SPACE / (frequency * BM1397_CORE_COUNT * 1000000)) * 1000;
 
         // Time to execute the above code is ~0.3ms
-        // vTaskDelay((BM1397_FULLSCAN_MS - 0.3 ) / portTICK_PERIOD_MS);
         vTaskDelay((GLOBAL_STATE->asic_job_frequency_ms - 0.3) / portTICK_PERIOD_MS);
     }
 }

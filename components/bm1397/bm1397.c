@@ -58,6 +58,7 @@ static const char *TAG = "bm1397Module";
 
 static uint8_t asic_response_buffer[CHUNK_SIZE];
 static uint32_t prev_nonce = 0;
+static uint8_t prev_job_id = 0xff;
 static task_result result;
 
 /// @brief
@@ -361,17 +362,19 @@ void BM1397_send_work(void *pvParameters, bm_job *next_bm_job)
         memcpy(job.midstate3, next_bm_job->midstate3, 32);
     }
 
-    if (GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[job.job_id] != NULL)
-    {
-        free_bm_job(GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[job.job_id]);
-    }
-
-    GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[job.job_id] = next_bm_job;
-
+    // Only 32 job slots exist (the id steps by 4), so a slot is recycled within a second. The
+    // old job used to be freed outside the lock while ASIC_result_task still held a pointer to
+    // it - swap and free under the same lock the reader takes its snapshot under.
     pthread_mutex_lock(&GLOBAL_STATE->valid_jobs_lock);
+    bm_job *previous = GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[job.job_id];
+    GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[job.job_id] = next_bm_job;
     GLOBAL_STATE->valid_jobs[job.job_id] = 1;
-    // ESP_LOGI(TAG, "Added Job: %i", job.job_id);
     pthread_mutex_unlock(&GLOBAL_STATE->valid_jobs_lock);
+
+    if (previous != NULL)
+    {
+        free_bm_job(previous);
+    }
 
     _send_BM1397((TYPE_JOB | GROUP_SINGLE | CMD_WRITE), &job, sizeof(job_packet), false);
 }
@@ -410,52 +413,46 @@ task_result *BM1397_proccess_work(void *pvParameters)
 
     if (asic_result == NULL)
     {
-        ESP_LOGI(TAG, "return null");
         return NULL;
     }
-    ESP_LOGI(TAG, "return not null");
-
-    uint8_t nonce_found = 0;
-    uint32_t first_nonce = 0;
 
     uint8_t rx_job_id = asic_result->job_id & 0xfc;
     uint8_t rx_midstate_index = asic_result->job_id & 0x03;
 
     GlobalState *GLOBAL_STATE = (GlobalState *)pvParameters;
-    if (GLOBAL_STATE->valid_jobs[rx_job_id] == 0)
+
+    // The sender may recycle this slot at any moment, so read the two fields we need while
+    // holding the lock instead of dereferencing the shared pointer.
+    uint32_t job_version = 0, job_version_mask = 0;
+    pthread_mutex_lock(&GLOBAL_STATE->valid_jobs_lock);
+    bool valid = GLOBAL_STATE->valid_jobs[rx_job_id] != 0 && GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[rx_job_id] != NULL;
+    if (valid)
     {
-        ESP_LOGI(TAG, "Invalid job nonce found, id=%d", rx_job_id);
+        job_version = GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[rx_job_id]->version;
+        job_version_mask = GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[rx_job_id]->version_mask;
+    }
+    pthread_mutex_unlock(&GLOBAL_STATE->valid_jobs_lock);
+
+    if (!valid)
+    {
+        ESP_LOGD(TAG, "Invalid job nonce found, id=%d", rx_job_id);
         return NULL;
     }
 
-    uint32_t rolled_version = GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[rx_job_id]->version;
+    uint32_t rolled_version = job_version;
     for (int i = 0; i < rx_midstate_index; i++)
     {
-        rolled_version = increment_bitmask(rolled_version, GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[rx_job_id]->version_mask);
+        rolled_version = increment_bitmask(rolled_version, job_version_mask);
     }
 
-    // ASIC may return the same nonce multiple times
-    // or one that was already found
-    // most of the time it behavies however
-    if (nonce_found == 0)
-    {
-        first_nonce = asic_result->nonce;
-        nonce_found = 1;
-    }
-    else if (asic_result->nonce == first_nonce)
-    {
-        // stop if we've already seen this nonce
-        return NULL;
-    }
-
-    if (asic_result->nonce == prev_nonce)
+    // The chip repeats a nonce now and then. Keying the filter on the nonce alone also threw
+    // away a legitimate repeat in a different job, so compare the pair.
+    if (asic_result->job_id == prev_job_id && asic_result->nonce == prev_nonce)
     {
         return NULL;
     }
-    else
-    {
-        prev_nonce = asic_result->nonce;
-    }
+    prev_job_id = asic_result->job_id;
+    prev_nonce = asic_result->nonce;
 
     result.job_id = rx_job_id;
     result.nonce = asic_result->nonce;

@@ -1,15 +1,25 @@
 #include <string.h>
 #include <stdio.h>
 #include <limits.h>
+#include "esp_log.h"
 #include "mining.h"
 #include "utils.h"
 #include "mbedtls/sha256.h"
 
 void free_bm_job(bm_job *job)
 {
-    free(job->jobid);
-    free(job->extranonce2);
     free(job);
+}
+
+void bm_job_set_ids(bm_job *job, const char *jobid, const char *extranonce2)
+{
+    // A truncated id is rejected by the pool as an unknown job, so say so rather than
+    // leaving a silent stream of rejects to explain later.
+    if (strlen(jobid) >= JOBID_SIZE || strlen(extranonce2) >= EXTRANONCE2_STR_SIZE) {
+        ESP_LOGE("mining", "job id or extranonce2 too long, shares will be rejected");
+    }
+    snprintf(job->jobid, JOBID_SIZE, "%s", jobid);
+    snprintf(job->extranonce2, EXTRANONCE2_STR_SIZE, "%s", extranonce2);
 }
 
 char *construct_coinbase_tx(const char *coinbase_1, const char *coinbase_2,

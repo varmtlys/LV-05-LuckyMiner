@@ -20,7 +20,9 @@
 #include "dns_server.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
+#include "esp_core_dump.h"
 #include "esp_ota_ops.h"
+#include "esp_system.h"
 #include "esp_wifi.h"
 #include "lwip/err.h"
 #include "lwip/inet.h"
@@ -231,6 +233,19 @@ static esp_err_t handle_options_request(httpd_req_t * req)
     return ESP_OK;
 }
 
+// Settings arrive straight from a form and are persisted, so a nonsensical value survives the
+// reboot it causes and there is no way back in. Bounds mirror the ranges declared in Kconfig.
+static uint16_t _clamp_u16(int value, uint16_t min, uint16_t max)
+{
+    if (value < (int) min) {
+        return min;
+    }
+    if (value > (int) max) {
+        return max;
+    }
+    return (uint16_t) value;
+}
+
 static esp_err_t PATCH_update_settings(httpd_req_t * req)
 {
     // Set CORS headers
@@ -267,6 +282,9 @@ static esp_err_t PATCH_update_settings(httpd_req_t * req)
     if ((item = cJSON_GetObjectItem(root, "stratumUser")) != NULL) {
         nvs_config_set_string(NVS_CONFIG_STRATUM_USER, item->valuestring);
     }
+    if ((item = cJSON_GetObjectItem(root, "stratumPassword")) != NULL && cJSON_IsString(item)) {
+        nvs_config_set_string(NVS_CONFIG_STRATUM_PASS, item->valuestring);
+    }
     if ((item = cJSON_GetObjectItem(root, "stratumPort")) != NULL) {
         nvs_config_set_u16(NVS_CONFIG_STRATUM_PORT, item->valueint);
     }
@@ -277,10 +295,10 @@ static esp_err_t PATCH_update_settings(httpd_req_t * req)
         nvs_config_set_string(NVS_CONFIG_WIFI_PASS, item->valuestring);
     }
     if ((item = cJSON_GetObjectItem(root, "coreVoltage")) != NULL) {
-        nvs_config_set_u16(NVS_CONFIG_ASIC_VOLTAGE, item->valueint);
+        nvs_config_set_u16(NVS_CONFIG_ASIC_VOLTAGE, _clamp_u16(item->valueint, 1000, 1800));
     }
     if ((item = cJSON_GetObjectItem(root, "frequency")) != NULL) {
-        nvs_config_set_u16(NVS_CONFIG_ASIC_FREQ, item->valueint);
+        nvs_config_set_u16(NVS_CONFIG_ASIC_FREQ, _clamp_u16(item->valueint, 50, 800));
     }
     if ((item = cJSON_GetObjectItem(root, "flipscreen")) != NULL) {
         nvs_config_set_u16(NVS_CONFIG_FLIP_SCREEN, item->valueint);
@@ -334,6 +352,74 @@ static esp_err_t GET_swarm(httpd_req_t * req)
 }
 
 /* Simple handler for getting system handler */
+// Address of the last panic plus its backtrace, so a crash can be located on a board whose
+// serial port is not reachable. Resolve the addresses with:
+//   xtensa-esp32s3-elf-addr2line -pfiaC -e build/esp-miner.elf <addr> ...
+static esp_err_t GET_coredump(httpd_req_t * req)
+{
+    if (set_cors_headers(req) != ESP_OK) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    cJSON * root = cJSON_CreateObject();
+    esp_core_dump_summary_t * summary = malloc(sizeof(esp_core_dump_summary_t));
+
+    if (summary != NULL && esp_core_dump_get_summary(summary) == ESP_OK) {
+        char addr[16];
+        snprintf(addr, sizeof(addr), "0x%08lx", (unsigned long) summary->exc_pc);
+        cJSON_AddStringToObject(root, "excPC", addr);
+        cJSON_AddStringToObject(root, "task", summary->exc_task);
+
+        cJSON * bt = cJSON_AddArrayToObject(root, "backtrace");
+        for (uint32_t i = 0; i < summary->exc_bt_info.depth; i++) {
+            snprintf(addr, sizeof(addr), "0x%08lx", (unsigned long) summary->exc_bt_info.bt[i]);
+            cJSON_AddItemToArray(bt, cJSON_CreateString(addr));
+        }
+    } else {
+        cJSON_AddStringToObject(root, "excPC", "");
+        cJSON_AddStringToObject(root, "task", "no core dump stored");
+    }
+
+    free(summary);
+
+    const char * response = cJSON_Print(root);
+    httpd_resp_set_type(req, HTTPD_TYPE_JSON);
+    httpd_resp_sendstr(req, response);
+    free((void *) response);
+    cJSON_Delete(root);
+
+    return ESP_OK;
+}
+
+// Why the chip last came up. Distinguishes a crash from a brownout from a normal restart, which
+// otherwise needs a serial console this hardware does not expose.
+static const char * _reset_reason_str(void)
+{
+    switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:
+        return "power on";
+    case ESP_RST_EXT:
+        return "external reset";
+    case ESP_RST_SW:
+        return "software restart";
+    case ESP_RST_PANIC:
+        return "crash (panic)";
+    case ESP_RST_INT_WDT:
+        return "interrupt watchdog";
+    case ESP_RST_TASK_WDT:
+        return "task watchdog";
+    case ESP_RST_WDT:
+        return "watchdog";
+    case ESP_RST_BROWNOUT:
+        return "brownout (power supply)";
+    case ESP_RST_DEEPSLEEP:
+        return "deep sleep";
+    default:
+        return "unknown";
+    }
+}
+
 static esp_err_t GET_system_info(httpd_req_t * req)
 {
     httpd_resp_set_type(req, "application/json");
@@ -348,6 +434,7 @@ static esp_err_t GET_system_info(httpd_req_t * req)
     char * wifiPass = nvs_config_get_string(NVS_CONFIG_WIFI_PASS, CONFIG_ESP_WIFI_PASSWORD);
     char * stratumURL = nvs_config_get_string(NVS_CONFIG_STRATUM_URL, CONFIG_STRATUM_URL);
     char * stratumUser = nvs_config_get_string(NVS_CONFIG_STRATUM_USER, CONFIG_STRATUM_USER);
+    char * stratumPassword = nvs_config_get_string(NVS_CONFIG_STRATUM_PASS, CONFIG_STRATUM_PW);
 
     cJSON * root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "power", GLOBAL_STATE->POWER_MANAGEMENT_MODULE.power);
@@ -358,6 +445,13 @@ static esp_err_t GET_system_info(httpd_req_t * req)
     cJSON_AddNumberToObject(root, "hashRate", GLOBAL_STATE->SYSTEM_MODULE.current_hashrate);
     cJSON_AddStringToObject(root, "bestDiff", GLOBAL_STATE->SYSTEM_MODULE.best_diff_string);
 
+    // Post-mortem for a device with no reachable serial port: why the last boot happened, and
+    // whether mining is currently stopped on purpose.
+    cJSON_AddStringToObject(root, "resetReason", _reset_reason_str());
+    cJSON_AddStringToObject(root, "haltReason", GLOBAL_STATE->SYSTEM_MODULE.halt_reason != NULL
+                                                    ? GLOBAL_STATE->SYSTEM_MODULE.halt_reason
+                                                    : "");
+
     cJSON_AddNumberToObject(root, "freeHeap", esp_get_free_heap_size());
     cJSON_AddNumberToObject(root, "coreVoltage", nvs_config_get_u16(NVS_CONFIG_ASIC_VOLTAGE, CONFIG_ASIC_VOLTAGE));
     cJSON_AddNumberToObject(root, "coreVoltageActual", ADC_get_vcore());
@@ -365,13 +459,24 @@ static esp_err_t GET_system_info(httpd_req_t * req)
     cJSON_AddStringToObject(root, "ssid", ssid);
     cJSON_AddStringToObject(root, "wifiPass", wifiPass);
     cJSON_AddStringToObject(root, "wifiStatus", GLOBAL_STATE->SYSTEM_MODULE.wifi_status);
+    // Pipeline diagnostics: pool -> stratum_queue -> ASIC_jobs_queue -> chip -> asicResults.
+    // The first counter that stays at zero is where mining stops.
+    char version_mask[12];
+    snprintf(version_mask, sizeof(version_mask), "%08lx", (unsigned long) GLOBAL_STATE->version_mask);
+    cJSON_AddStringToObject(root, "versionMask", version_mask);
+    cJSON_AddNumberToObject(root, "stratumQueue", GLOBAL_STATE->stratum_queue.count);
+    cJSON_AddNumberToObject(root, "asicQueue", GLOBAL_STATE->ASIC_jobs_queue.count);
+    cJSON_AddNumberToObject(root, "asicResults", GLOBAL_STATE->SYSTEM_MODULE.asic_results);
+    cJSON_AddStringToObject(root, "lastPoolError", GLOBAL_STATE->SYSTEM_MODULE.last_pool_error);
+    cJSON_AddNumberToObject(root, "sharesSubmitted", GLOBAL_STATE->SYSTEM_MODULE.shares_submitted);
     cJSON_AddNumberToObject(root, "sharesAccepted", GLOBAL_STATE->SYSTEM_MODULE.shares_accepted);
     cJSON_AddNumberToObject(root, "sharesRejected", GLOBAL_STATE->SYSTEM_MODULE.shares_rejected);
     cJSON_AddNumberToObject(root, "uptimeSeconds", (esp_timer_get_time() - GLOBAL_STATE->SYSTEM_MODULE.start_time) / 1000000);
-    cJSON_AddStringToObject(root, "ASICModel", GLOBAL_STATE->asic_model);
+    cJSON_AddStringToObject(root, "ASICModel", ASIC_MODEL);
     cJSON_AddStringToObject(root, "stratumURL", stratumURL);
     cJSON_AddNumberToObject(root, "stratumPort", nvs_config_get_u16(NVS_CONFIG_STRATUM_PORT, CONFIG_STRATUM_PORT));
     cJSON_AddStringToObject(root, "stratumUser", stratumUser);
+    cJSON_AddStringToObject(root, "stratumPassword", stratumPassword);
 
     cJSON_AddStringToObject(root, "version", esp_app_get_description()->version);
     cJSON_AddStringToObject(root, "runningPartition", esp_ota_get_running_partition()->label);
@@ -388,10 +493,11 @@ static esp_err_t GET_system_info(httpd_req_t * req)
     free(wifiPass);
     free(stratumURL);
     free(stratumUser);
+    free(stratumPassword);
 
     const char * sys_info = cJSON_Print(root);
     httpd_resp_sendstr(req, sys_info);
-    free(sys_info);
+    free((void *) sys_info);
     cJSON_Delete(root);
     return ESP_OK;
 }
@@ -482,9 +588,19 @@ esp_err_t POST_OTA_update(httpd_req_t * req)
     return ESP_OK;
 }
 
-void log_to_websocket(const char * format, va_list args)
+// esp_log_set_vprintf() expects vprintf_like_t, so this has to return the character count.
+// The va_list is also consumed by the first use, hence the copy for the console.
+int log_to_websocket(const char * format, va_list args)
 {
+    va_list console_args;
+    va_copy(console_args, args);
+    int written = vprintf(format, console_args);
+    va_end(console_args);
+
     char * log_buffer = (char *) malloc(2048);
+    if (log_buffer == NULL) {
+        return written;
+    }
     vsnprintf(log_buffer, 2048, format, args);
 
     httpd_ws_frame_t ws_pkt;
@@ -492,12 +608,12 @@ void log_to_websocket(const char * format, va_list args)
     ws_pkt.payload = (uint8_t *) log_buffer;
     ws_pkt.len = strlen(log_buffer);
     ws_pkt.type = HTTPD_WS_TYPE_TEXT;
-    vprintf(format, args);
     if (httpd_ws_send_frame_async(server, fd, &ws_pkt) != ESP_OK) {
         esp_log_set_vprintf(vprintf);
     }
 
     free(log_buffer);
+    return written;
 }
 
 /*
@@ -555,7 +671,11 @@ esp_err_t start_rest_server(void * pvParameters)
         .uri = "/api/system/info", .method = HTTP_GET, .handler = GET_system_info, .user_ctx = rest_context};
     httpd_register_uri_handler(server, &system_info_get_uri);
 
-    httpd_uri_t swarm_get_uri = {.uri = "/api/swarm/info", .method = HTTP_GET, .handler = GET_swarm, .user_ctx = rest_context};
+    httpd_uri_t coredump_get_uri = {
+        .uri = "/api/system/coredump", .method = HTTP_GET, .handler = GET_coredump, .user_ctx = rest_context};
+    httpd_register_uri_handler(server, &coredump_get_uri);
+
+    httpd_uri_t swarm_get_uri ={.uri = "/api/swarm/info", .method = HTTP_GET, .handler = GET_swarm, .user_ctx = rest_context};
     httpd_register_uri_handler(server, &swarm_get_uri);
 
     httpd_uri_t update_swarm_uri = {

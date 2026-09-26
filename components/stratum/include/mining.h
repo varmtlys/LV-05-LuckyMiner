@@ -3,6 +3,10 @@
 
 #include "stratum_api.h"
 
+// Pool job ids are short in practice; extranonce2 is hex, so twice the byte length.
+#define JOBID_SIZE 64
+#define EXTRANONCE2_STR_SIZE 32
+
 typedef struct
 {
     uint32_t version;
@@ -20,10 +24,17 @@ typedef struct
     uint8_t midstate1[32];
     uint8_t midstate2[32];
     uint8_t midstate3[32];
-    uint32_t pool_diff;
-    char *jobid;
-    char *extranonce2;
+    double pool_diff;
+    // Inline rather than heap pointers: a job is malloc'd and freed ~50 times a second, and the
+    // two strdup/free pairs per job were the only thing stopping a plain struct copy. Copying is
+    // what lets ASIC_result_task take a snapshot under the lock instead of holding a pointer the
+    // sender may free underneath it.
+    char jobid[JOBID_SIZE];
+    char extranonce2[EXTRANONCE2_STR_SIZE];
 } bm_job;
+
+// Fills jobid/extranonce2, warning instead of silently truncating.
+void bm_job_set_ids(bm_job *job, const char *jobid, const char *extranonce2);
 
 void free_bm_job(bm_job *job);
 

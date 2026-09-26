@@ -5,7 +5,6 @@ SRCS
     "EMC2101.c"
     "fonts.c"
     "INA260.c"
-    "led_controller.c"
     "main.c"
     "nvs_config.c"
     "oled.c"

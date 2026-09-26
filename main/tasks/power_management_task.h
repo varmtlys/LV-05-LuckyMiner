@@ -12,7 +12,6 @@ typedef struct
     float current;
 } PowerManagementModule;
 
-static void automatic_fan_speed(float chip_temp);
 void POWER_MANAGEMENT_task(void * pvParameters);
 
 #endif

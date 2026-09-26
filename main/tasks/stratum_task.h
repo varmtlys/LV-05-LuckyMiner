@@ -3,7 +3,8 @@
 
 typedef struct
 {
-    uint32_t stratum_difficulty;
+    // double, not uint32_t: pools may set a difficulty below 1
+    double stratum_difficulty;
 } SystemTaskModule;
 
 void stratum_task(void *pvParameters);

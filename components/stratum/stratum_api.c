@@ -13,6 +13,8 @@
 #include "utils.h"
 
 #define BUFFER_SIZE 1024
+// How many lines the handshake will read while waiting for the subscribe result.
+#define HANDSHAKE_MAX_LINES 10
 static const char *TAG = "stratum_api";
 
 static char *json_rpc_buffer = NULL;
@@ -84,10 +86,16 @@ char *STRATUM_V1_receive_jsonrpc_line(int sockfd)
         {
             memset(recv_buffer, 0, BUFFER_SIZE);
             nbytes = recv(sockfd, recv_buffer, BUFFER_SIZE - 1, 0);
-            if (nbytes == -1)
+            if (nbytes <= 0)
             {
-                perror("recv");
-                esp_restart();
+                // -1: socket error, 0: the pool closed the connection.
+                // Hand the failure back so the caller can reconnect. Restarting the chip here
+                // turned a pool that hangs up during the handshake into an endless reboot loop,
+                // and spinning on nbytes == 0 (the behaviour before that) hung the miner instead.
+                ESP_LOGE(TAG, "recv returned %d, connection lost", nbytes);
+                // drop the partial line so the next connection starts clean
+                strcpy(json_rpc_buffer, "");
+                return NULL;
             }
 
             realloc_json_buffer(nbytes);
@@ -105,8 +113,21 @@ char *STRATUM_V1_receive_jsonrpc_line(int sockfd)
     return line;
 }
 
+// cJSON_GetArrayItem returns NULL past the end of an array, and the params a pool sends are
+// untrusted input. Without this every short or differently typed params array dereferenced
+// NULL and rebooted the miner, which on a pool that keeps resending it is a reboot loop.
+static const char *_array_string(cJSON *array, int index)
+{
+    cJSON *item = cJSON_GetArrayItem(array, index);
+
+    return cJSON_IsString(item) ? item->valuestring : NULL;
+}
+
 void STRATUM_V1_parse(StratumApiV1Message *message, const char *stratum_json)
 {
+    // the caller reuses one message struct, so clear the owned pointer from the previous line
+    message->extranonce_str = NULL;
+
     cJSON *json = cJSON_Parse(stratum_json);
 
     cJSON *id_json = cJSON_GetObjectItem(json, "id");
@@ -133,23 +154,36 @@ void STRATUM_V1_parse(StratumApiV1Message *message, const char *stratum_json)
         {
             result = MINING_SET_VERSION_MASK;
         }
+        else if (strcmp("mining.set_extranonce", method_json->valuestring) == 0)
+        {
+            result = MINING_SET_EXTRANONCE;
+        }
     }
     else
     {
         // parse results
         cJSON *result_json = cJSON_GetObjectItem(json, "result");
-        if (result_json != NULL && cJSON_IsBool(result_json))
+        cJSON *error_json = cJSON_GetObjectItem(json, "error");
+        bool has_error = error_json != NULL && !cJSON_IsNull(error_json);
+
+        // A rejected share comes back as {"result":null,"error":[21,"Job not found",null]}.
+        // Testing only for a boolean result dropped those on the floor, so rejections went
+        // uncounted and their reason was never seen.
+        if ((result_json != NULL && cJSON_IsBool(result_json)) || has_error)
         {
-
             result = STRATUM_RESULT;
+            message->response_success = cJSON_IsTrue(result_json) && !has_error;
 
-            bool response_success = false;
-            if (result_json != NULL && cJSON_IsTrue(result_json))
+            message->error_str[0] = 0;
+            if (has_error)
             {
-                response_success = true;
+                cJSON *text = cJSON_IsArray(error_json) ? cJSON_GetArrayItem(error_json, 1) : error_json;
+                if (cJSON_IsString(text))
+                {
+                    strncpy(message->error_str, text->valuestring, sizeof(message->error_str) - 1);
+                    message->error_str[sizeof(message->error_str) - 1] = 0;
+                }
             }
-
-            message->response_success = response_success;
         }
         else
         {
@@ -167,51 +201,127 @@ void STRATUM_V1_parse(StratumApiV1Message *message, const char *stratum_json)
     if (message->method == MINING_NOTIFY)
     {
 
-        mining_notify *new_work = malloc(sizeof(mining_notify));
-        // new_work->difficulty = difficulty;
         cJSON *params = cJSON_GetObjectItem(json, "params");
-        new_work->job_id = strdup(cJSON_GetArrayItem(params, 0)->valuestring);
-        new_work->prev_block_hash = strdup(cJSON_GetArrayItem(params, 1)->valuestring);
-        new_work->coinbase_1 = strdup(cJSON_GetArrayItem(params, 2)->valuestring);
-        new_work->coinbase_2 = strdup(cJSON_GetArrayItem(params, 3)->valuestring);
 
+        const char *job_id = _array_string(params, 0);
+        const char *prev_block_hash = _array_string(params, 1);
+        const char *coinbase_1 = _array_string(params, 2);
+        const char *coinbase_2 = _array_string(params, 3);
         cJSON *merkle_branch = cJSON_GetArrayItem(params, 4);
-        new_work->n_merkle_branches = cJSON_GetArraySize(merkle_branch);
-        if (new_work->n_merkle_branches > MAX_MERKLE_BRANCHES)
+        const char *version = _array_string(params, 5);
+        const char *target = _array_string(params, 6);
+        const char *ntime = _array_string(params, 7);
+
+        int n_merkle_branches = cJSON_IsArray(merkle_branch) ? cJSON_GetArraySize(merkle_branch) : 0;
+
+        bool usable = job_id != NULL && prev_block_hash != NULL && coinbase_1 != NULL && coinbase_2 != NULL &&
+                      cJSON_IsArray(merkle_branch) && version != NULL && target != NULL && ntime != NULL;
+
+        // Both hashes feed fixed 32 byte slots, and swap_endian_words() calls exit() on anything
+        // not word aligned, so a pool sending an odd length here would take the miner down.
+        if (usable && strlen(prev_block_hash) != HASH_SIZE * 2)
         {
-            printf("Too many Merkle branches.\n");
-            abort();
+            usable = false;
         }
-        new_work->merkle_branches = malloc(HASH_SIZE * new_work->n_merkle_branches);
-        for (size_t i = 0; i < new_work->n_merkle_branches; i++)
+
+        for (int i = 0; usable && i < n_merkle_branches; i++)
         {
-            hex2bin(cJSON_GetArrayItem(merkle_branch, i)->valuestring, new_work->merkle_branches + HASH_SIZE * i, HASH_SIZE * 2);
+            const char *branch = _array_string(merkle_branch, i);
+            if (branch == NULL || strlen(branch) != HASH_SIZE * 2)
+            {
+                usable = false;
+            }
         }
 
-        new_work->version = strtoul(cJSON_GetArrayItem(params, 5)->valuestring, NULL, 16);
-        new_work->target = strtoul(cJSON_GetArrayItem(params, 6)->valuestring, NULL, 16);
-        new_work->ntime = strtoul(cJSON_GetArrayItem(params, 7)->valuestring, NULL, 16);
+        if (!usable)
+        {
+            ESP_LOGE(TAG, "Malformed mining.notify, ignoring job: %s", stratum_json);
+            message->method = STRATUM_UNKNOWN;
+        }
+        else if (n_merkle_branches > MAX_MERKLE_BRANCHES)
+        {
+            // used to abort(), which reboots the chip on a job it could simply skip
+            ESP_LOGE(TAG, "Too many merkle branches (%d > %d), ignoring job", n_merkle_branches, MAX_MERKLE_BRANCHES);
+            message->method = STRATUM_UNKNOWN;
+        }
+        else
+        {
+            mining_notify *new_work = malloc(sizeof(mining_notify));
+            new_work->job_id = strdup(job_id);
+            new_work->prev_block_hash = strdup(prev_block_hash);
+            new_work->coinbase_1 = strdup(coinbase_1);
+            new_work->coinbase_2 = strdup(coinbase_2);
 
-        message->mining_notification = new_work;
+            new_work->n_merkle_branches = n_merkle_branches;
+            new_work->merkle_branches = malloc(HASH_SIZE * n_merkle_branches);
+            for (int i = 0; i < n_merkle_branches; i++)
+            {
+                // HASH_SIZE, not HASH_SIZE * 2: the third argument is the size of the destination
+                // slot, so the old value let a longer hex string write 64 bytes into 32.
+                hex2bin(_array_string(merkle_branch, i), new_work->merkle_branches + HASH_SIZE * i, HASH_SIZE);
+            }
 
-        // params can be varible length
-        int paramsLength = cJSON_GetArraySize(params);
-        int value = cJSON_IsTrue(cJSON_GetArrayItem(params, paramsLength - 1));
-        message->should_abandon_work = value;
+            new_work->version = strtoul(version, NULL, 16);
+            new_work->target = strtoul(target, NULL, 16);
+            new_work->ntime = strtoul(ntime, NULL, 16);
+
+            message->mining_notification = new_work;
+
+            // params can be varible length
+            int paramsLength = cJSON_GetArraySize(params);
+            int value = cJSON_IsTrue(cJSON_GetArrayItem(params, paramsLength - 1));
+            message->should_abandon_work = value;
+        }
     }
     else if (message->method == MINING_SET_DIFFICULTY)
     {
         cJSON *params = cJSON_GetObjectItem(json, "params");
-        uint32_t difficulty = cJSON_GetArrayItem(params, 0)->valueint;
+        cJSON *difficulty = cJSON_GetArrayItem(params, 0);
 
-        message->new_difficulty = difficulty;
+        if (cJSON_IsNumber(difficulty))
+        {
+            // valuedouble, not valueint: pools with little hashrate hand out difficulties
+            // below 1, and truncating those to 0 makes every nonce look like a valid share.
+            message->new_difficulty = difficulty->valuedouble;
+        }
+        else
+        {
+            ESP_LOGE(TAG, "Malformed set_difficulty: %s", stratum_json);
+            message->method = STRATUM_UNKNOWN;
+        }
+    }
+    else if (message->method == MINING_SET_EXTRANONCE)
+    {
+        cJSON *params = cJSON_GetObjectItem(json, "params");
+        cJSON *extranonce = cJSON_GetArrayItem(params, 0);
+        cJSON *extranonce_2_len = cJSON_GetArrayItem(params, 1);
+
+        if (cJSON_IsString(extranonce) && cJSON_IsNumber(extranonce_2_len))
+        {
+            message->extranonce_str = strdup(extranonce->valuestring);
+            message->extranonce_2_len = extranonce_2_len->valueint;
+        }
+        else
+        {
+            ESP_LOGE(TAG, "Malformed set_extranonce: %s", stratum_json);
+            message->method = STRATUM_UNKNOWN;
+        }
     }
     else if (message->method == MINING_SET_VERSION_MASK)
     {
 
         cJSON *params = cJSON_GetObjectItem(json, "params");
-        uint32_t version_mask = strtoul(cJSON_GetArrayItem(params, 0)->valuestring, NULL, 16);
-        message->version_mask = version_mask;
+        const char *mask = _array_string(params, 0);
+
+        if (mask != NULL)
+        {
+            message->version_mask = strtoul(mask, NULL, 16);
+        }
+        else
+        {
+            ESP_LOGE(TAG, "Malformed set_version_mask: %s", stratum_json);
+            message->method = STRATUM_UNKNOWN;
+        }
     }
 
     cJSON_Delete(json);
@@ -227,62 +337,109 @@ void STRATUM_V1_free_mining_notify(mining_notify *params)
     free(params);
 }
 
+// Returns 0 when the line really is a mining.subscribe result, -1 for anything else.
+// Called on every line during the handshake, so a mismatch is normal and stays quiet.
 int _parse_stratum_subscribe_result_message(const char *result_json_str,
-                                            char **extranonce,
+                                            char *extranonce,
+                                            size_t extranonce_size,
                                             int *extranonce2_len)
 {
+    int rc = -1;
+
     cJSON *root = cJSON_Parse(result_json_str);
     if (root == NULL)
     {
         ESP_LOGE(TAG, "Unable to parse %s", result_json_str);
         return -1;
     }
+
+    // a subscribe result is [[subscriptions...], extranonce1, extranonce2_len]
     cJSON *result = cJSON_GetObjectItem(root, "result");
-    if (result == NULL)
+    if (cJSON_IsArray(result) && cJSON_GetArraySize(result) >= 3)
     {
-        ESP_LOGE(TAG, "Unable to parse subscribe result %s", result_json_str);
-        return -1;
-    }
+        cJSON *extranonce_json = cJSON_GetArrayItem(result, 1);
+        cJSON *extranonce2_len_json = cJSON_GetArrayItem(result, 2);
 
-    cJSON *extranonce2_len_json = cJSON_GetArrayItem(result, 2);
-    if (extranonce2_len_json == NULL)
-    {
-        ESP_LOGE(TAG, "Unable to parse extranonce2_len: %s", result->valuestring);
-        return -1;
+        if (cJSON_IsString(extranonce_json) && cJSON_IsNumber(extranonce2_len_json) &&
+            strlen(extranonce_json->valuestring) < extranonce_size)
+        {
+            *extranonce2_len = extranonce2_len_json->valueint;
+            strcpy(extranonce, extranonce_json->valuestring);
+            rc = 0;
+        }
+        else
+        {
+            ESP_LOGE(TAG, "Malformed subscribe result: %s", result_json_str);
+        }
     }
-    *extranonce2_len = extranonce2_len_json->valueint;
-
-    cJSON *extranonce_json = cJSON_GetArrayItem(result, 1);
-    if (extranonce_json == NULL)
-    {
-        ESP_LOGE(TAG, "Unable parse extranonce: %s", result->valuestring);
-        return -1;
-    }
-    *extranonce = malloc(strlen(extranonce_json->valuestring) + 1);
-    strcpy(*extranonce, extranonce_json->valuestring);
 
     cJSON_Delete(root);
 
-    return 0;
+    return rc;
 }
 
-int STRATUM_V1_subscribe(int socket, char ** extranonce, int * extranonce2_len, char * model)
+// Pulls the granted mask out of a mining.configure reply. Returns 0 when the line was one.
+static int _parse_version_mask_result(const char *json_str, uint32_t *version_mask)
+{
+    int rc = -1;
+
+    cJSON *root = cJSON_Parse(json_str);
+    if (root == NULL)
+    {
+        return -1;
+    }
+
+    cJSON *result = cJSON_GetObjectItem(root, "result");
+    cJSON *mask = cJSON_GetObjectItem(result, "version-rolling.mask");
+    if (cJSON_IsString(mask))
+    {
+        *version_mask = strtoul(mask->valuestring, NULL, 16);
+        rc = 0;
+    }
+
+    cJSON_Delete(root);
+
+    return rc;
+}
+
+int STRATUM_V1_subscribe(int socket, char * extranonce, size_t extranonce_size, int * extranonce2_len, char * model,
+                         uint32_t * version_mask)
 {
     // Subscribe
     char subscribe_msg[BUFFER_SIZE];
     sprintf(subscribe_msg, "{\"id\": %d, \"method\": \"mining.subscribe\", \"params\": [\"LuckyMiner %s\"]}\n", send_uid++, model);
     debug_stratum_tx(subscribe_msg);
     write(socket, subscribe_msg, strlen(subscribe_msg));
-    char * line;
-    line = STRATUM_V1_receive_jsonrpc_line(socket);
 
-    ESP_LOGI(TAG, "Received result %s", line);
+    // mining.configure went out first, so its reply can arrive before the subscribe result.
+    // Read until the subscribe result turns up rather than assuming it is the very next line.
+    for (int i = 0; i < HANDSHAKE_MAX_LINES; i++)
+    {
+        char * line = STRATUM_V1_receive_jsonrpc_line(socket);
+        if (line == NULL)
+        {
+            ESP_LOGE(TAG, "Pool closed the connection during subscribe");
+            return -1;
+        }
 
-    _parse_stratum_subscribe_result_message(line, extranonce, extranonce2_len);
+        ESP_LOGI(TAG, "Received result %s", line);
 
-    free(line);
+        if (_parse_version_mask_result(line, version_mask) == 0)
+        {
+            ESP_LOGI(TAG, "Pool granted version mask: %08lx", *version_mask);
+        }
+        else if (_parse_stratum_subscribe_result_message(line, extranonce, extranonce_size, extranonce2_len) == 0)
+        {
+            free(line);
+            return 1;
+        }
 
-    return 1;
+        free(line);
+    }
+
+    ESP_LOGE(TAG, "No subscribe result from pool after %d lines", HANDSHAKE_MAX_LINES);
+
+    return -1;
 }
 
 int STRATUM_V1_suggest_difficulty(int socket, uint32_t difficulty)
@@ -304,11 +461,13 @@ int STRATUM_V1_suggest_difficulty(int socket, uint32_t difficulty)
     return 1;
 }
 
-int STRATUM_V1_authenticate(int socket, const char *username)
+int STRATUM_V1_authenticate(int socket, const char *username, const char *password)
 {
     char authorize_msg[BUFFER_SIZE];
-    sprintf(authorize_msg, "{\"id\": %d, \"method\": \"mining.authorize\", \"params\": [\"%s\", \"x\"]}\n",
-            send_uid++, username);
+    // The password was hardcoded to "x". Multi-coin pools carry options in it, such as
+    // zpool's "c=PPC" that selects the payout currency, so it has to be configurable.
+    sprintf(authorize_msg, "{\"id\": %d, \"method\": \"mining.authorize\", \"params\": [\"%s\", \"%s\"]}\n",
+            send_uid++, username, password);
     debug_stratum_tx(authorize_msg);
 
     write(socket, authorize_msg, strlen(authorize_msg));
@@ -324,11 +483,22 @@ int STRATUM_V1_authenticate(int socket, const char *username)
 /// @param nonce The hex-encoded nonce value to use in the block header.
 void STRATUM_V1_submit_share(int socket, const char *username, const char *jobid,
                              const char *extranonce_2, const uint32_t ntime, const uint32_t nonce,
-                             const uint32_t version)
+                             const uint32_t version, const bool send_version_bits)
 {
     char submit_msg[BUFFER_SIZE];
-    sprintf(submit_msg, "{\"id\": %d, \"method\": \"mining.submit\", \"params\": [\"%s\", \"%s\", \"%s\", \"%08lx\", \"%08lx\", \"%08lx\"]}\n",
-            send_uid++, username, jobid, extranonce_2, ntime, nonce, version);
+
+    if (send_version_bits)
+    {
+        sprintf(submit_msg, "{\"id\": %d, \"method\": \"mining.submit\", \"params\": [\"%s\", \"%s\", \"%s\", \"%08lx\", \"%08lx\", \"%08lx\"]}\n",
+                send_uid++, username, jobid, extranonce_2, ntime, nonce, version);
+    }
+    else
+    {
+        // A pool that never negotiated version rolling rejects the 6th parameter.
+        sprintf(submit_msg, "{\"id\": %d, \"method\": \"mining.submit\", \"params\": [\"%s\", \"%s\", \"%s\", \"%08lx\", \"%08lx\"]}\n",
+                send_uid++, username, jobid, extranonce_2, ntime, nonce);
+    }
+
     debug_stratum_tx(submit_msg);
     write(socket, submit_msg, strlen(submit_msg));
 }

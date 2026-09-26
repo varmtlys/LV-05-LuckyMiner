@@ -1,4 +1,3 @@
-import { eASICModel } from './enum/eASICModel';
 
 export interface ISystemInfo {
 
@@ -16,17 +15,26 @@ export interface ISystemInfo {
     ssid: string,
     wifiPass: string,
     wifiStatus: string,
+    versionMask: string,
+    stratumQueue: number,
+    asicQueue: number,
+    asicResults: number,
+    lastPoolError: string,
+    sharesSubmitted: number,
     sharesAccepted: number,
     sharesRejected: number,
     uptimeSeconds: number,
-    ASICModel: eASICModel,
+    ASICModel: string,
     stratumURL: string,
     stratumPort: number,
     stratumUser: string,
+    stratumPassword: string,
     frequency: number,
     version: string,
     invertfanpolarity: number,
     autofanspeed: number,
     fanspeed: number,
-    coreVoltageActual: number
+    coreVoltageActual: number,
+    resetReason: string,
+    haltReason: string
 }

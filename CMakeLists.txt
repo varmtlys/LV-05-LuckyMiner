@@ -8,6 +8,10 @@ cmake_minimum_required(VERSION 3.5)
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 
+# Without this ESP-IDF derives the version from `git describe`, which reports the same
+# "<commit>-dirty" for every build off uncommitted changes and so cannot tell two builds apart.
+# Shown on the OLED connection screen and in the web interface. Bump it when flashing something new.
+set(PROJECT_VER "LV05-1.0")
 
 project(esp-miner)
 

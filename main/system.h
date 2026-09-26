@@ -17,6 +17,12 @@ typedef struct
     int historical_hashrate_init;
     double current_hashrate;
     int64_t start_time;
+    // Diagnostics: how many results the ASIC has ever returned. Zero means the chip is
+    // silent, which separates a hardware/init fault from a problem further up the chain.
+    uint32_t asic_results;
+    // last reason a pool gave for refusing a share
+    char last_pool_error[64];
+    uint16_t shares_submitted;
     uint16_t shares_accepted;
     uint16_t shares_rejected;
     int screen_page;
@@ -27,6 +33,10 @@ typedef struct
     bool startup_done;
     char ssid[20];
     char wifi_status[20];
+
+    // Set when a fault stops mining. Non-NULL means the ASIC is idle on purpose; Wi-Fi and the
+    // web server keep running so the device stays reachable instead of rebooting out of reach.
+    const char * halt_reason;
 
     uint32_t lastClockSync;
 } SystemModule;

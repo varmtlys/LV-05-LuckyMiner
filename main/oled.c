@@ -185,6 +185,16 @@ static void oledWriteDataBlock(uint8_t * ucBuf, int iLen)
     iScreenOffset += iLen;
 }
 
+int OLED_writeBitmap(int x, int y, const uint8_t * data, int len)
+{
+    if (!oled_active || x < 0 || len < 0 || x + len > 128) {
+        return -1;
+    }
+    oledSetPosition(x, y);
+    oledWriteDataBlock((uint8_t *) data, len);
+    return 0;
+}
+
 // Set (or clear) an individual pixel
 // The local copy of the frame buffer is used to avoid
 // reading data from the display controller

@@ -1,5 +1,6 @@
 #include "unity.h"
 #include "stratum_api.h"
+#include <stdlib.h>
 
 TEST_CASE("Parse stratum method", "[stratum]")
 {
@@ -65,7 +66,58 @@ TEST_CASE("Parse stratum set_difficulty params", "[mining.set_difficulty]")
     StratumApiV1Message stratum_api_v1_message = {};
     STRATUM_V1_parse(&stratum_api_v1_message, json_string);
     TEST_ASSERT_EQUAL(MINING_SET_DIFFICULTY, stratum_api_v1_message.method);
-    TEST_ASSERT_EQUAL(1638, stratum_api_v1_message.new_difficulty);
+    TEST_ASSERT_EQUAL_DOUBLE(1638.0, stratum_api_v1_message.new_difficulty);
+}
+
+TEST_CASE("Parse stratum fractional set_difficulty params", "[mining.set_difficulty]")
+{
+    // small pools hand out difficulties below 1; truncating to 0 would flood them with shares
+    const char *json_string = "{\"id\":null,\"method\":\"mining.set_difficulty\",\"params\":[0.5]}";
+    StratumApiV1Message stratum_api_v1_message = {};
+    STRATUM_V1_parse(&stratum_api_v1_message, json_string);
+    TEST_ASSERT_EQUAL(MINING_SET_DIFFICULTY, stratum_api_v1_message.method);
+    TEST_ASSERT_EQUAL_DOUBLE(0.5, stratum_api_v1_message.new_difficulty);
+}
+
+// A pool that sends something unexpected must be ignored, never crash the miner. Every case
+// below used to dereference NULL, call exit() or overflow a buffer, which reboots the device
+// and, because the pool keeps resending, turns into an endless boot loop.
+TEST_CASE("Malformed notify with too few params is ignored", "[mining.notify]")
+{
+    StratumApiV1Message stratum_api_v1_message = {};
+    const char *json_string = "{\"id\":null,\"method\":\"mining.notify\",\"params\":[\"deadbeef\",\"00\"]}";
+    STRATUM_V1_parse(&stratum_api_v1_message, json_string);
+    TEST_ASSERT_EQUAL(STRATUM_UNKNOWN, stratum_api_v1_message.method);
+}
+
+TEST_CASE("Malformed notify with a short prev_block_hash is ignored", "[mining.notify]")
+{
+    StratumApiV1Message stratum_api_v1_message = {};
+    // swap_endian_words() calls exit() when this is not 4-byte word aligned
+    const char *json_string = "{\"id\":null,\"method\":\"mining.notify\",\"params\":"
+                              "[\"job1\",\"abc\",\"01000000\",\"00000000\",[],"
+                              "\"20000004\",\"1705dd01\",\"64b8c7f5\",false]}";
+    STRATUM_V1_parse(&stratum_api_v1_message, json_string);
+    TEST_ASSERT_EQUAL(STRATUM_UNKNOWN, stratum_api_v1_message.method);
+}
+
+TEST_CASE("Malformed set_difficulty is ignored", "[mining.set_difficulty]")
+{
+    StratumApiV1Message stratum_api_v1_message = {};
+    const char *json_string = "{\"id\":null,\"method\":\"mining.set_difficulty\",\"params\":[]}";
+    STRATUM_V1_parse(&stratum_api_v1_message, json_string);
+    TEST_ASSERT_EQUAL(STRATUM_UNKNOWN, stratum_api_v1_message.method);
+}
+
+TEST_CASE("Parse stratum set_extranonce params", "[mining.set_extranonce]")
+{
+    const char *json_string = "{\"id\":null,\"method\":\"mining.set_extranonce\",\"params\":[\"08000002\",4]}";
+    StratumApiV1Message stratum_api_v1_message = {};
+    STRATUM_V1_parse(&stratum_api_v1_message, json_string);
+    TEST_ASSERT_EQUAL(MINING_SET_EXTRANONCE, stratum_api_v1_message.method);
+    TEST_ASSERT_EQUAL_STRING("08000002", stratum_api_v1_message.extranonce_str);
+    TEST_ASSERT_EQUAL(4, stratum_api_v1_message.extranonce_2_len);
+    free(stratum_api_v1_message.extranonce_str);
 }
 
 TEST_CASE("Parse stratum notify params", "[mining.notify]")
